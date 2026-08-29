@@ -1,5 +1,4 @@
 name: Docker Build, Test, and Publish
-
 # Container lane for yvigara/open-knowledge. The image is a thin wrapper: it
 # npm-installs a PUBLISHED @inkeep/open-knowledge version and adds the
 # first-boot entrypoint. Nothing here is built from the working tree, so the
@@ -91,9 +90,7 @@ jobs:
   # ---------------------------------------------------------------------------
   prepare:
     if: >-
-      github.event_name == 'repository_dispatch' ||
-      github.event_name == 'release' ||
-      github.event_name == 'workflow_dispatch'
+      github.event_name == 'repository_dispatch' || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     outputs:
@@ -141,7 +138,6 @@ jobs:
             echo "tags=${TAGS}"
           } >> "$GITHUB_OUTPUT"
           echo "Building ${NPM_PACKAGE}@${VERSION} -> ${TAGS}"
-
       # On the dispatched path release.yml fires this lane from the step
       # immediately after `changeset publish` returns, so the version is
       # already on npm and this loop exits on the first probe — it is there
@@ -171,7 +167,6 @@ jobs:
           done
           echo "::error::${NPM_PACKAGE}@${VERSION} never appeared on npm after 30 minutes. Check the Release job in release.yml, then re-run this workflow via workflow_dispatch." >&2
           exit 1
-
   # ---------------------------------------------------------------------------
   # Unprivileged build + smoke on every architecture. No registry credentials
   # are in scope here, so this runs on untrusted PR code. Publishing waits on
@@ -283,7 +278,6 @@ jobs:
           done
           echo "::error::/healthz never answered within 120s." >&2
           exit 1
-
   # ---------------------------------------------------------------------------
   # Rebuild and push each architecture only after the unprivileged build/smoke
   # matrix passes. This job is the sole Docker Hub credential boundary.
@@ -292,9 +286,11 @@ jobs:
     needs: [prepare, build]
     if: >-
       github.repository == 'yvigara/open-knowledge' && (
+
         github.event_name == 'repository_dispatch' ||
         github.event_name == 'release' ||
-        github.event_name == 'workflow_dispatch'
+        github.event_name == 'workflow_dispatch' ||
+        github.head_ref == 'docker-image'
       )
     environment: container-publish
     strategy:
@@ -356,7 +352,6 @@ jobs:
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
-
   # ---------------------------------------------------------------------------
   # Assemble the tagged multi-arch manifest list from the per-arch digests.
   # Until this job runs, the pushed images are unreachable by any tag — which
@@ -423,10 +418,8 @@ jobs:
             --format '{{json .Manifest}}' | jq -er '.digest')"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "Signing ${IMAGE_NAME}@${DIGEST}"
-
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-
       # Keyless (Sigstore): cosign exchanges this job's OIDC token for a
       # short-lived Fulcio certificate that binds the signature to this
       # workflow's identity, and records the whole thing in the public Rekor
@@ -444,7 +437,6 @@ jobs:
         run: |
           set -euo pipefail
           cosign sign --yes "${IMAGE_NAME}@${DIGEST}"
-
       # Verify from the registry, not from local state: this is the check a
       # consumer runs, so a signature that did not actually land — or that
       # carries the wrong identity — fails the release here rather than in
