@@ -26,7 +26,8 @@ on:
       - scripts/docker/**
       - .github/workflows/docker.yaml
   push:
-    branches: [main]
+    # --- BRANCH TEST HARNESS (revert to `[main]` before merge) ---
+    branches: [main, docker-image]
     paths:
       - Dockerfile
       - scripts/docker/**
@@ -89,8 +90,16 @@ jobs:
   # dist-tag and publishes nothing, so it needs none of this.
   # ---------------------------------------------------------------------------
   prepare:
+    # --- BRANCH TEST HARNESS (drop the two docker-image clauses before merge) ---
+    # This is the gate that matters: everything downstream is `needs: prepare`,
+    # so a PR/main-lane run where prepare is SKIPPED can never reach publish,
+    # whatever publish's own `if` says. Both a push to docker-image
+    # (github.ref) and a PR opened from it (github.head_ref) take the publish
+    # path so the full chain — prepare, build, publish, merge, cosign — runs.
     if: >-
-      github.event_name == 'repository_dispatch' || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+      github.ref == 'refs/heads/docker-image' || github.head_ref == 'docker-image' ||
+      github.event_name == 'repository_dispatch' || github.event_name == 'release' ||
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     outputs:
@@ -107,8 +116,21 @@ jobs:
           # workflow_dispatch) has no release object, so the expression yields
           # '' and the fallback derives the answer from the version string:
           # the cadence only ever produces X.Y.Z or X.Y.Z-beta.N.
-          RAW_TAG: ${{ github.event.release.tag_name || github.event.client_payload.version || inputs.version }}
+          # --- BRANCH TEST HARNESS (drop the 'v0.66.2' fallback before merge) ---
+          # A branch run carries no release, no payload and no input, so the
+          # chain falls through to the hardcoded tag. v0.66.2 is npm's current
+          # `latest`, so the image really installs and the smoke's
+          # `ok --version` == OK_VERSION assertion is a real check.
+          RAW_TAG: ${{ github.event.release.tag_name || github.event.client_payload.version || inputs.version || 'v0.66.2' }}
           IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          # --- BRANCH TEST HARNESS (drop TAG_PREFIX entirely before merge) ---
+          # '' on every real run. On the branch, every computed tag gets a
+          # `test-` prefix: the multi-tag path (version + X.Y + latest, or
+          # version + beta), push-by-digest, the manifest merge and the cosign
+          # signature all run for real, but a half-published run from an
+          # unmerged workflow can never land on a tag `docker pull` resolves
+          # to. Set it to '' if you want this run to publish the real tags.
+          TAG_PREFIX: ${{ (github.ref == 'refs/heads/docker-image' || github.head_ref == 'docker-image') && 'test-' || '' }}
         run: |
           set -euo pipefail
           VERSION="${RAW_TAG#v}"
@@ -122,14 +144,15 @@ jobs:
           esac
           PRERELEASE="${IS_PRERELEASE:-$DERIVED}"
 
-          TAGS="${IMAGE_NAME}:${VERSION}"
+          # TAG_PREFIX is '' on every real run — BRANCH TEST HARNESS, above.
+          TAGS="${IMAGE_NAME}:${TAG_PREFIX}${VERSION}"
           if [ "$PRERELEASE" = "true" ]; then
             # Betas share one moving tag. No `latest`, no X.Y: a prerelease
             # must never become what a bare `docker pull` resolves to.
-            TAGS="${TAGS},${IMAGE_NAME}:beta"
+            TAGS="${TAGS},${IMAGE_NAME}:${TAG_PREFIX}beta"
           else
             MINOR="${VERSION%.*}"
-            TAGS="${TAGS},${IMAGE_NAME}:${MINOR},${IMAGE_NAME}:latest"
+            TAGS="${TAGS},${IMAGE_NAME}:${TAG_PREFIX}${MINOR},${IMAGE_NAME}:${TAG_PREFIX}latest"
           fi
 
           {
@@ -286,11 +309,11 @@ jobs:
     needs: [prepare, build]
     if: >-
       github.repository == 'yvigara/open-knowledge' && (
-
+        github.ref == 'refs/heads/docker-image' ||
+        github.head_ref == 'docker-image' ||
         github.event_name == 'repository_dispatch' ||
         github.event_name == 'release' ||
-        github.event_name == 'workflow_dispatch' ||
-        github.head_ref == 'docker-image'
+        github.event_name == 'workflow_dispatch'
       )
     environment: container-publish
     strategy:
@@ -410,7 +433,9 @@ jobs:
       - name: Resolve + verify the published manifest
         id: manifest
         env:
-          VERSION: ${{ needs.prepare.outputs.version }}
+          # The `test-` half is the BRANCH TEST HARNESS prefix — '' on every
+          # real run. Drop it with the rest of the harness before merge.
+          VERSION: ${{ (github.ref == 'refs/heads/docker-image' || github.head_ref == 'docker-image') && 'test-' || '' }}${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
           docker buildx imagetools inspect "${IMAGE_NAME}:${VERSION}"
