@@ -10,12 +10,15 @@ name: Docker Build, Test, and Publish
 # run in progress for the whole container build, and GitHub refuses
 # `gh run rerun` on a run that is still in progress — so one slow advisory job
 # would block every rerun of the fast required jobs. A dispatched run reruns
-# and cancels independently, and a Docker Hub outage cannot stall a release.
+# and cancels independently, and a registry outage cannot stall a release.
 #
-# Trusted publishes resolve the environment-scoped Docker Hub secrets in this
-# same workflow, never across a workflow boundary. The published manifest is
-# signed with cosign keyless (Sigstore) in the merge job, which is also the
-# only job holding `id-token: write`.
+# The registry is GHCR, authenticated with the workflow's own GITHUB_TOKEN —
+# no registry secret exists in this repo, so there is nothing to scope across
+# a workflow boundary, nothing to rotate, and nothing a fork PR could reach
+# (a PR's token is read-only, and the publish jobs never run for one anyway).
+# `packages: write` is granted per-job, only where a push happens. The
+# published manifest is signed with cosign keyless (Sigstore) in the merge
+# job, which is also the only job holding `id-token: write`.
 on:
   # PR + main: build and smoke both architectures, publish nothing. Scoped to
   # the files that can actually change the image; the app code cannot, since
@@ -60,7 +63,7 @@ on:
   release:
     types: [published]
   # Manual recovery: rebuild an image for an existing release (e.g. an
-  # entrypoint fix, or a transient Docker Hub failure) without cutting a new
+  # entrypoint fix, or a transient registry failure) without cutting a new
   # one. Mirrors the recovery paths in release.yml / desktop-release.yml.
   workflow_dispatch:
     inputs:
@@ -81,11 +84,14 @@ concurrency:
   group: docker-${{ github.event.pull_request.number || github.event.release.tag_name || github.event.client_payload.version || inputs.version || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 env:
-  IMAGE_NAME: yvigara/open-knowledge
+  # GHCR path. The owner/name segment must be lowercase — it already is, but
+  # a rename to anything mixed-case would need `tr '[:upper:]' '[:lower:]'`
+  # here, because the registry rejects the push rather than normalizing it.
+  IMAGE_NAME: ghcr.io/yvigara/open-knowledge
   NPM_PACKAGE: "@inkeep/open-knowledge"
 jobs:
   # ---------------------------------------------------------------------------
-  # Resolve the version this run pins and the Docker Hub tags it will carry.
+  # Resolve the version this run pins and the GHCR tags it will carry.
   # Runs for publish triggers only; the PR/main lane builds the npm `latest`
   # dist-tag and publishes nothing, so it needs none of this.
   # ---------------------------------------------------------------------------
@@ -97,9 +103,7 @@ jobs:
     # (github.ref) and a PR opened from it (github.head_ref) take the publish
     # path so the full chain — prepare, build, publish, merge, cosign — runs.
     if: >-
-      github.ref == 'refs/heads/docker-image' || github.head_ref == 'docker-image' ||
-      github.event_name == 'repository_dispatch' || github.event_name == 'release' ||
-      github.event_name == 'workflow_dispatch'
+      github.ref == 'refs/heads/docker-image' || github.head_ref == 'docker-image' || github.event_name == 'repository_dispatch' || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     outputs:
@@ -224,7 +228,7 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Retry once on transient Docker Hub / buildkit pull failures. The
+      # Retry once on transient registry / buildkit pull failures. The
       # action's own network setup is the flaky part, and a second attempt
       # costs seconds against a 30-minute job.
       - name: Set up Docker Buildx
@@ -303,12 +307,14 @@ jobs:
           exit 1
   # ---------------------------------------------------------------------------
   # Rebuild and push each architecture only after the unprivileged build/smoke
-  # matrix passes. This job is the sole Docker Hub credential boundary.
+  # matrix passes. Together with `merge` this is the only place a registry
+  # write happens, and the only place `packages: write` is granted.
   # ---------------------------------------------------------------------------
   publish:
     needs: [prepare, build]
     if: >-
       github.repository == 'yvigara/open-knowledge' && (
+
         github.ref == 'refs/heads/docker-image' ||
         github.head_ref == 'docker-image' ||
         github.event_name == 'repository_dispatch' ||
@@ -329,10 +335,13 @@ jobs:
             platform: linux/arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout trusted source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Retry once on transient Docker Hub / buildkit pull failures.
+      # Retry once on transient registry / buildkit pull failures.
       # See build job for rationale; same pattern.
       - name: Set up Docker Buildx
         id: buildx
@@ -341,11 +350,12 @@ jobs:
       - name: Set up Docker Buildx (retry)
         if: steps.buildx.outcome == 'failure'
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - name: Log in to Docker Hub
+      - name: Log in to GHCR
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       # Push by digest only (no tag). The merge job assembles the tagged
       # manifest list after both architecture publishers complete.
       - name: Push ${{ matrix.arch }} by digest
@@ -386,13 +396,16 @@ jobs:
     timeout-minutes: 15
     environment: container-publish
     # Job-level permissions REPLACE the workflow-level block, so `contents`
-    # has to be restated. `id-token: write` mints the OIDC token cosign
-    # exchanges with Fulcio for its short-lived signing certificate — keyless,
-    # so there is no private key to store or rotate. It is scoped to this job
-    # alone: no other job needs to assert this workflow's identity, and the
-    # build job runs untrusted PR code.
+    # has to be restated. `packages: write` covers BOTH registry writes this
+    # job makes — the tagged manifest list and the cosign `.sig` tag beside
+    # it. `id-token: write` mints the OIDC token cosign exchanges with Fulcio
+    # for its short-lived signing certificate — keyless, so there is no
+    # private key to store or rotate. Both are scoped to this job alone: no
+    # other job needs to assert this workflow's identity, and the build job
+    # runs untrusted PR code.
     permissions:
       contents: read
+      packages: write
       id-token: write
     steps:
       - name: Download digest artifacts
@@ -403,11 +416,12 @@ jobs:
           merge-multiple: true
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - name: Log in to Docker Hub
+      - name: Log in to GHCR
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Create + push the tagged manifest list
         env:
           TAGS: ${{ needs.prepare.outputs.tags }}
@@ -449,13 +463,11 @@ jobs:
       # short-lived Fulcio certificate that binds the signature to this
       # workflow's identity, and records the whole thing in the public Rekor
       # transparency log. Nothing secret is involved, which is the point — the
-      # Docker Hub token stays the only credential this lane holds.
+      # run-scoped GITHUB_TOKEN stays the only credential this lane holds.
       #
-      # The signature is pushed to Docker Hub as a `sha256-<digest>.sig` tag
-      # alongside the image (Docker Hub does not implement the OCI 1.1
-      # referrers API, so cosign's default tag scheme is the only one that
-      # works there). It needs the registry write the login step above already
-      # granted.
+      # The signature is pushed alongside the image as a `sha256-<digest>.sig`
+      # tag (cosign's default scheme, portable across registries), so it needs
+      # the same `packages: write` + GHCR login the manifest push above used.
       - name: Sign the manifest list (keyless)
         env:
           DIGEST: ${{ steps.manifest.outputs.digest }}
