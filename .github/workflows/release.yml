@@ -786,3 +786,56 @@ jobs:
 
           echo "Publishing with --tag ${TAG} (VERSION=${VERSION})"
           npm publish "$TARBALL" --access public --tag "$TAG" --provenance --registry https://registry.npmjs.org/
+
+  # The container lane (docker.yaml) builds an image that npm-installs the
+  # version the publish job just pushed, so it can only start once that job
+  # has returned — and it has to be dispatched explicitly. Every Release in
+  # this cadence is created as a draft and flipped to published by
+  # desktop-release.yml under GITHUB_TOKEN, and GitHub suppresses cascading
+  # runs from GITHUB_TOKEN-authored events, so docker.yaml's
+  # `release: published` trigger never fires for a CI-published release.
+  # `repository_dispatch` is the same documented exemption the
+  # desktop-release dispatch above relies on. It lives in its own job because
+  # the publish job holds only `id-token: write`, and the dispatches API
+  # needs `contents: write`.
+  #
+  # Fire-and-forget on purpose: the API call returns as soon as the run is
+  # queued, so a slow image build or a registry outage cannot stall the
+  # release cadence. Failures surface in docker.yaml's own run, and an
+  # operator re-fires it with `gh workflow run docker.yaml -f version=...`.
+  #
+  # One dispatch covers all three lanes, because all three reach npm through
+  # the publish job: beta cuts (push/workflow_dispatch), stable promotions
+  # (promote-stable.yml) and point releases (point-release.yml) — the latter
+  # two arriving as publish-stable.
+  docker-dispatch:
+    name: Trigger container image build (${{ github.event.action || github.event_name }})
+    needs: [build, release, publish]
+    if: github.event.action == 'publish-stable' || needs.build.outputs.run_beta == 'true'
+    runs-on: ubuntu-latest
+    cache-mode: none
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Trigger docker.yaml to build + publish the container image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTION: ${{ github.event.action }}
+          BETA_VERSION: ${{ needs.release.outputs.version }}
+          STABLE_VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$ACTION" == "publish-stable" ]]; then
+            VERSION="$STABLE_VERSION"
+          else
+            VERSION="$BETA_VERSION"
+          fi
+          if [[ -z "$VERSION" ]]; then
+            echo "::warning::No release version resolved; skipping the container-build dispatch. Rebuild with 'gh workflow run docker.yaml -f version=<version>'."
+            exit 0
+          fi
+          payload=$(jq -nc --arg version "v${VERSION}" \
+            '{event_type: "container-build", client_payload: {version: $version}}')
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/dispatches" --input - <<<"$payload"
+          echo "Dispatched container-build for v${VERSION}; docker.yaml will build, smoke, publish and cosign-sign the multi-arch image."

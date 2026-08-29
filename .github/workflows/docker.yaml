@@ -1,0 +1,480 @@
+name: Docker Build, Test, and Publish
+
+# Container lane for yvigara/open-knowledge. The image is a thin wrapper: it
+# npm-installs a PUBLISHED @inkeep/open-knowledge version and adds the
+# first-boot entrypoint. Nothing here is built from the working tree, so the
+# only thing that makes an image reproducible is the version it pins — which
+# is why every published image passes OK_VERSION explicitly (see Dockerfile).
+#
+# No other workflow CALLS this one: release.yml only fires a
+# `repository_dispatch` at it. A reusable-workflow call would keep the caller
+# run in progress for the whole container build, and GitHub refuses
+# `gh run rerun` on a run that is still in progress — so one slow advisory job
+# would block every rerun of the fast required jobs. A dispatched run reruns
+# and cancels independently, and a Docker Hub outage cannot stall a release.
+#
+# Trusted publishes resolve the environment-scoped Docker Hub secrets in this
+# same workflow, never across a workflow boundary. The published manifest is
+# signed with cosign keyless (Sigstore) in the merge job, which is also the
+# only job holding `id-token: write`.
+on:
+  # PR + main: build and smoke both architectures, publish nothing. Scoped to
+  # the files that can actually change the image; the app code cannot, since
+  # it arrives from npm.
+  pull_request:
+    paths:
+      - Dockerfile
+      - scripts/docker/**
+      - .github/workflows/docker.yaml
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - scripts/docker/**
+      - .github/workflows/docker.yaml
+  # THE publish trigger for the automated cadence. release.yml fires it
+  # immediately after `changeset publish` returns, on all three lanes that
+  # reach npm through that one job: beta cuts, stable promotions
+  # (promote-stable.yml) and point releases (point-release.yml).
+  #
+  # It has to be an explicit dispatch. Every Release in this cadence is created
+  # as a draft and flipped to published by desktop-release.yml running under
+  # GITHUB_TOKEN, and GitHub deliberately suppresses cascading workflow runs
+  # from GITHUB_TOKEN-authored events — so the `release:` trigger below cannot
+  # fire for a CI-published release, and a lane that relied on it would build
+  # nothing, silently. `repository_dispatch` is the documented exemption, and
+  # is exactly why release.yml already dispatches desktop-release.yml rather
+  # than letting the release event cascade.
+  #
+  # client_payload: { version: "vX.Y.Z" | "vX.Y.Z-beta.N" } — the release tag.
+  # The v prefix is optional (prepare strips it) but release.yml sends the tag
+  # verbatim so this run lands in the same concurrency group as the `release:`
+  # run an operator recovery would produce.
+  repository_dispatch:
+    types: [container-build]
+  # Operator recovery only. An operator who flips a stuck draft from their own
+  # machine — `gh release edit <tag> --draft=false`, the command
+  # desktop-release.yml prints on failure — authenticates with a PAT, and a
+  # PAT-authored release event DOES cascade. CI-published releases never reach
+  # here; see the repository_dispatch comment above.
+  release:
+    types: [published]
+  # Manual recovery: rebuild an image for an existing release (e.g. an
+  # entrypoint fix, or a transient Docker Hub failure) without cutting a new
+  # one. Mirrors the recovery paths in release.yml / desktop-release.yml.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Released version to build, with or without the v prefix (e.g. v0.63.6 or 0.63.6-beta.3)"
+        required: true
+        type: string
+permissions:
+  contents: read
+# Concurrency: release/main runs are NEVER cancelled so every release gets its
+# own image. PR runs reuse a PR-scoped group with cancel-in-progress: true so
+# rapid pushes to the same PR collapse to the latest commit.
+#
+# Deliberately NOT in the shared `ok-release-cadence` group that release.yml,
+# promote-stable.yml and point-release.yml hold: this lane runs downstream of
+# the npm publish and must never be able to stall a release cut.
+concurrency:
+  group: docker-${{ github.event.pull_request.number || github.event.release.tag_name || github.event.client_payload.version || inputs.version || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  IMAGE_NAME: yvigara/open-knowledge
+  NPM_PACKAGE: "@inkeep/open-knowledge"
+jobs:
+  # ---------------------------------------------------------------------------
+  # Resolve the version this run pins and the Docker Hub tags it will carry.
+  # Runs for publish triggers only; the PR/main lane builds the npm `latest`
+  # dist-tag and publishes nothing, so it needs none of this.
+  # ---------------------------------------------------------------------------
+  prepare:
+    if: >-
+      github.event_name == 'repository_dispatch' ||
+      github.event_name == 'release' ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      tags: ${{ steps.resolve.outputs.tags }}
+    steps:
+      - name: Resolve version + Docker tags
+        id: resolve
+        env:
+          # `github.event.release.prerelease` is the release's own flag, which
+          # is what distinguishes a beta cut from a stable promotion. A
+          # dispatched run (repository_dispatch from release.yml, or a manual
+          # workflow_dispatch) has no release object, so the expression yields
+          # '' and the fallback derives the answer from the version string:
+          # the cadence only ever produces X.Y.Z or X.Y.Z-beta.N.
+          RAW_TAG: ${{ github.event.release.tag_name || github.event.client_payload.version || inputs.version }}
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -euo pipefail
+          VERSION="${RAW_TAG#v}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'${RAW_TAG}' is not a release version this lane can build (expected vX.Y.Z or vX.Y.Z-beta.N)." >&2
+            exit 1
+          fi
+          case "$VERSION" in
+            *-*) DERIVED=true ;;
+            *)   DERIVED=false ;;
+          esac
+          PRERELEASE="${IS_PRERELEASE:-$DERIVED}"
+
+          TAGS="${IMAGE_NAME}:${VERSION}"
+          if [ "$PRERELEASE" = "true" ]; then
+            # Betas share one moving tag. No `latest`, no X.Y: a prerelease
+            # must never become what a bare `docker pull` resolves to.
+            TAGS="${TAGS},${IMAGE_NAME}:beta"
+          else
+            MINOR="${VERSION%.*}"
+            TAGS="${TAGS},${IMAGE_NAME}:${MINOR},${IMAGE_NAME}:latest"
+          fi
+
+          {
+            echo "version=${VERSION}"
+            echo "prerelease=${PRERELEASE}"
+            echo "tags=${TAGS}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building ${NPM_PACKAGE}@${VERSION} -> ${TAGS}"
+
+      # On the dispatched path release.yml fires this lane from the step
+      # immediately after `changeset publish` returns, so the version is
+      # already on npm and this loop exits on the first probe — it is there
+      # for registry read-after-write lag (npm's CDN can serve a stale packument
+      # for seconds after a publish), not for a long wait.
+      #
+      # It stays a wait rather than an assertion because the operator-recovery
+      # and manual paths can reach here with the npm publish still in flight:
+      # on a stable cut promote-stable.yml creates a DRAFT, desktop-release.yml
+      # flips it to published, and only THEN dispatches publish-stable to
+      # release.yml — so a release event that beats the npm publish would find
+      # no such version and `npm install -g pkg@X.Y.Z` would fail outright.
+      # Waiting here, rather than making release.yml wait on this lane, keeps
+      # the container build off the release cadence's critical path.
+      - name: Wait for the npm version to be published
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 90); do
+            if npm view "${NPM_PACKAGE}@${VERSION}" version >/dev/null 2>&1; then
+              echo "${NPM_PACKAGE}@${VERSION} is on npm (attempt ${attempt})."
+              exit 0
+            fi
+            echo "Attempt ${attempt}/90: ${NPM_PACKAGE}@${VERSION} not on npm yet; retrying in 20s."
+            sleep 20
+          done
+          echo "::error::${NPM_PACKAGE}@${VERSION} never appeared on npm after 30 minutes. Check the Release job in release.yml, then re-run this workflow via workflow_dispatch." >&2
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # Unprivileged build + smoke on every architecture. No registry credentials
+  # are in scope here, so this runs on untrusted PR code. Publishing waits on
+  # this job passing for both arches.
+  # ---------------------------------------------------------------------------
+  build:
+    # Always runs; `prepare` is skipped on the PR/main lane, so guard on its
+    # result rather than on success() (a skipped dependency is not a failure).
+    needs: [prepare]
+    if: always() && needs.prepare.result != 'failure' && needs.prepare.result != 'cancelled'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          # Native arm64 rather than QEMU: the npm install layer under
+          # emulation costs multiples of the native runtime for no added
+          # coverage.
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      # On the PR/main lane there is no release to pin, so the image is built
+      # against whatever npm currently serves as `latest`. That is the right
+      # target for a Dockerfile/entrypoint change: it proves the change works
+      # against the version users are installing today.
+      OK_VERSION: ${{ needs.prepare.outputs.version || 'latest' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Retry once on transient Docker Hub / buildkit pull failures. The
+      # action's own network setup is the flaky part, and a second attempt
+      # costs seconds against a 30-minute job.
+      - name: Set up Docker Buildx
+        id: buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Set up Docker Buildx (retry)
+        if: steps.buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build ${{ matrix.arch }} image
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            OK_VERSION=${{ env.OK_VERSION }}
+          # Load into the local daemon so the smoke steps can run it. Single
+          # platform per job, which is what `load` requires.
+          load: true
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:ci-${{ matrix.arch }}
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          cache-to: type=gha,scope=docker-${{ matrix.arch }},mode=max
+      # The Dockerfile's whole job is to pin a version. Assert it actually did
+      # — a silently-wrong OK_VERSION would otherwise ship a mislabelled image.
+      - name: Smoke - binaries present and version pinned
+        run: |
+          set -euo pipefail
+          IMG="${IMAGE_NAME}:ci-${{ matrix.arch }}"
+          docker run --rm --entrypoint git "$IMG" --version
+          # `ok --version` prints the version on line 1, then the GPL
+          # copyright / free-software / no-warranty trio (packages/cli's
+          # buildVersionNotice). Only the first line is the version.
+          NOTICE="$(docker run --rm --entrypoint ok "$IMG" --version)"
+          INSTALLED="$(printf '%s\n' "$NOTICE" | head -n 1 | tr -d '[:space:]')"
+          INSTALLED="${INSTALLED#v}"
+          echo "ok --version reports: ${INSTALLED}"
+          if [ "${OK_VERSION}" != "latest" ] && [ "${INSTALLED}" != "${OK_VERSION}" ]; then
+            echo "::error::Image pins ${INSTALLED} but this run is building ${OK_VERSION}." >&2
+            exit 1
+          fi
+      # End-to-end first boot on an empty volume: the entrypoint's `ok init`
+      # branch, then `ok start`, then a real request. /healthz is mounted
+      # above every admission gate (packages/server/src/http/http-app.ts), so
+      # it answers a plain IP-Host probe — exactly what an orchestrator does.
+      # OK_ALLOW_EXTERNAL=1 is required because the image binds 0.0.0.0 and
+      # the server refuses a non-loopback bind without consent; the Dockerfile
+      # deliberately does not bake it, so the smoke must supply it.
+      - name: Smoke - first boot initializes and serves
+        run: |
+          set -euo pipefail
+          IMG="${IMAGE_NAME}:ci-${{ matrix.arch }}"
+          VOLUME="ok-smoke-${{ matrix.arch }}-${{ github.run_id }}"
+          trap 'docker logs ok-smoke 2>&1 | tail -n 100 || true; docker rm -f ok-smoke >/dev/null 2>&1 || true; docker volume rm -f "$VOLUME" >/dev/null 2>&1 || true' EXIT
+          docker volume create "$VOLUME" >/dev/null
+          docker run -d --name ok-smoke \
+            -e OK_ALLOW_EXTERNAL=1 \
+            -v "${VOLUME}:/opt/data" \
+            -p 127.0.0.1:8080:8080 \
+            "$IMG"
+          for attempt in $(seq 1 120); do
+            if [ "$(docker inspect -f '{{.State.Running}}' ok-smoke)" != "true" ]; then
+              echo "::error::Container exited during first boot." >&2
+              exit 1
+            fi
+            if curl -fsS --max-time 3 http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
+              echo "Server answered /healthz after ${attempt}s."
+              docker exec ok-smoke test -d /opt/data/.ok
+              echo "Volume initialized at /opt/data/.ok."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::/healthz never answered within 120s." >&2
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # Rebuild and push each architecture only after the unprivileged build/smoke
+  # matrix passes. This job is the sole Docker Hub credential boundary.
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [prepare, build]
+    if: >-
+      github.repository == 'yvigara/open-knowledge' && (
+        github.event_name == 'repository_dispatch' ||
+        github.event_name == 'release' ||
+        github.event_name == 'workflow_dispatch'
+      )
+    environment: container-publish
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          # Native arm64 for the same reason as the build matrix above.
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout trusted source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Retry once on transient Docker Hub / buildkit pull failures.
+      # See build job for rationale; same pattern.
+      - name: Set up Docker Buildx
+        id: buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Set up Docker Buildx (retry)
+        if: steps.buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to Docker Hub
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # Push by digest only (no tag). The merge job assembles the tagged
+      # manifest list after both architecture publishers complete.
+      - name: Push ${{ matrix.arch }} by digest
+        id: push
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          build-args: |
+            OK_VERSION=${{ needs.prepare.outputs.version }}
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.push.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Assemble the tagged multi-arch manifest list from the per-arch digests.
+  # Until this job runs, the pushed images are unreachable by any tag — which
+  # is the point: a half-published release never resolves for `docker pull`.
+  # ---------------------------------------------------------------------------
+  merge:
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: container-publish
+    # Job-level permissions REPLACE the workflow-level block, so `contents`
+    # has to be restated. `id-token: write` mints the OIDC token cosign
+    # exchanges with Fulcio for its short-lived signing certificate — keyless,
+    # so there is no private key to store or rotate. It is scoped to this job
+    # alone: no other job needs to assert this workflow's identity, and the
+    # build job runs untrusted PR code.
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download digest artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to Docker Hub
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Create + push the tagged manifest list
+        env:
+          TAGS: ${{ needs.prepare.outputs.tags }}
+        run: |
+          set -euo pipefail
+          TAG_ARGS=""
+          IFS=','
+          for tag in $TAGS; do
+            TAG_ARGS="${TAG_ARGS} --tag ${tag}"
+          done
+          unset IFS
+          SOURCES=""
+          for f in /tmp/digests/*; do
+            SOURCES="${SOURCES} ${IMAGE_NAME}@sha256:$(basename "$f")"
+          done
+          # shellcheck disable=SC2086
+          docker buildx imagetools create ${TAG_ARGS} ${SOURCES}
+      # Resolve the manifest LIST's own digest. Signing that digest covers
+      # every tag created above at once (`X.Y.Z`, `X.Y`, `latest` / `beta` all
+      # resolve to this one index) and keeps the signature valid when a later
+      # release moves `latest` off it — a tag is a mutable pointer, a digest is
+      # not, and cosign records the digest.
+      - name: Resolve + verify the published manifest
+        id: manifest
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "${IMAGE_NAME}:${VERSION}"
+          DIGEST="$(docker buildx imagetools inspect "${IMAGE_NAME}:${VERSION}" \
+            --format '{{json .Manifest}}' | jq -er '.digest')"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Signing ${IMAGE_NAME}@${DIGEST}"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Keyless (Sigstore): cosign exchanges this job's OIDC token for a
+      # short-lived Fulcio certificate that binds the signature to this
+      # workflow's identity, and records the whole thing in the public Rekor
+      # transparency log. Nothing secret is involved, which is the point — the
+      # Docker Hub token stays the only credential this lane holds.
+      #
+      # The signature is pushed to Docker Hub as a `sha256-<digest>.sig` tag
+      # alongside the image (Docker Hub does not implement the OCI 1.1
+      # referrers API, so cosign's default tag scheme is the only one that
+      # works there). It needs the registry write the login step above already
+      # granted.
+      - name: Sign the manifest list (keyless)
+        env:
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${IMAGE_NAME}@${DIGEST}"
+
+      # Verify from the registry, not from local state: this is the check a
+      # consumer runs, so a signature that did not actually land — or that
+      # carries the wrong identity — fails the release here rather than in
+      # someone else's admission controller.
+      #
+      # The identity regexp is anchored on this repo AND this workflow file, so
+      # a signature minted by any other workflow in the org does not satisfy
+      # it. `refs/` (not a fixed ref) because the signing run can legitimately
+      # be on refs/heads/main (dispatch) or refs/tags/vX.Y.Z (release event).
+      - name: Verify the signature
+        env:
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-identity-regexp "^https://github\.com/${GITHUB_REPOSITORY}/\.github/workflows/docker\.yaml@refs/" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${IMAGE_NAME}@${DIGEST}" > /dev/null
+          echo "Verified cosign signature on ${IMAGE_NAME}@${DIGEST}."
+          {
+            echo "### Container image published"
+            echo
+            echo "- \`${IMAGE_NAME}@${DIGEST}\`"
+            echo "- Tags: \`${{ needs.prepare.outputs.tags }}\`"
+            echo "- Signed with cosign keyless; verify with:"
+            echo
+            echo '```sh'
+            echo "cosign verify \\"
+            echo "  --certificate-identity-regexp '^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/docker.yaml@refs/' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  ${IMAGE_NAME}@${DIGEST}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
