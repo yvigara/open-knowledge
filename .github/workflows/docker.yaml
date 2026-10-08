@@ -36,7 +36,7 @@ on:
       - scripts/docker/**
       - .github/workflows/docker.yaml
   # THE publish trigger for the automated cadence. release.yml fires it
-  # immediately after `changeset publish` returns, on all three lanes that
+  # from a job that runs once its npm publish job succeeds, on all three lanes that
   # reach npm through that one job: beta cuts, stable promotions
   # (promote-stable.yml) and point releases (point-release.yml).
   #
@@ -165,8 +165,8 @@ jobs:
             echo "tags=${TAGS}"
           } >> "$GITHUB_OUTPUT"
           echo "Building ${NPM_PACKAGE}@${VERSION} -> ${TAGS}"
-      # On the dispatched path release.yml fires this lane from the step
-      # immediately after `changeset publish` returns, so the version is
+      # On the dispatched path release.yml fires this lane from a job that runs
+      # once its npm publish job succeeds, so the version is
       # already on npm and this loop exits on the first probe — it is there
       # for registry read-after-write lag (npm's CDN can serve a stale packument
       # for seconds after a publish), not for a long wait.
@@ -334,6 +334,9 @@ jobs:
             runner: ubuntu-24.04-arm
             platform: linux/arm64
     runs-on: ${{ matrix.runner }}
+    # Holds `packages: write`, so it restores nothing from the Actions cache:
+    # a poisoned layer would ship. The unprivileged build job keeps the cache.
+    cache-mode: none
     timeout-minutes: 30
     permissions:
       contents: read
@@ -371,7 +374,6 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           build-args: |
             OK_VERSION=${{ needs.prepare.outputs.version }}
-          cache-from: type=gha,scope=docker-${{ matrix.arch }}
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
       - name: Export digest
         run: |
@@ -393,6 +395,7 @@ jobs:
   merge:
     needs: [prepare, publish]
     runs-on: ubuntu-latest
+    cache-mode: none
     timeout-minutes: 15
     environment: container-publish
     # Job-level permissions REPLACE the workflow-level block, so `contents`
