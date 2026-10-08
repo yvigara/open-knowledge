@@ -15,7 +15,7 @@ ARG OK_VERSION=latest
 
 RUN npm install -g \
   "@inkeep/open-knowledge@${OK_VERSION}" \
-  @slidev/cli@52.19 \
+  @slidev/cli@53.0 \
   @slidev/theme-default@0.25
 
 # Recorded so a running container can name its own version without a
