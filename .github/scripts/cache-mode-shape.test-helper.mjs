@@ -20,6 +20,13 @@ const ACTIONS = {
   'dtolnay/rust-toolchain': CACHE_FREE,
   'taiki-e/install-action': CACHE_FREE,
   'linear/linear-release-action': CACHE_FREE,
+  'docker/setup-buildx-action': CACHE_FREE,
+  'docker/login-action': CACHE_FREE,
+  'sigstore/cosign-installer': CACHE_FREE,
+  'docker/build-push-action': (inputs) => [
+    ...(/type=gha/.test(inputs['cache-from'] ?? '') ? ['extract'] : []),
+    ...(/type=gha/.test(inputs['cache-to'] ?? '') ? ['save'] : []),
+  ],
   'actions/cache': () => ['extract', 'save'],
   'actions/cache/restore': (inputs) =>
     isLiteralTrue(inputs['lookup-only']) ? ['lookup'] : ['extract'],

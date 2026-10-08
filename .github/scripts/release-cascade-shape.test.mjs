@@ -2271,8 +2271,8 @@ describe('the release App credential never shares a job with installed packages'
 
     test('no job that runs package code holds a credential, and only the OIDC job publishes', () => {
       expect(releaseViolations(releaseWorkflow)).toEqual([]);
-      expect(Object.keys(releaseWorkflow.jobs)).toEqual(['read-releases', 'build', 'release', 'publish']);
-      const { 'read-releases': readReleases, build, release, publish } = releaseWorkflow.jobs;
+      expect(Object.keys(releaseWorkflow.jobs)).toEqual(['read-releases', 'build', 'release', 'publish', 'docker-dispatch']);
+      const { 'read-releases': readReleases, build, release, publish, 'docker-dispatch': dockerDispatch } = releaseWorkflow.jobs;
       expect(releasePackageRoutes(releaseWorkflow, readReleases)).toEqual([]);
       expect(readReleases.permissions).toEqual({ contents: 'write' });
       expect(releasePackageRoutes(releaseWorkflow, build).length).toBeGreaterThan(0);
@@ -2282,6 +2282,8 @@ describe('the release App credential never shares a job with installed packages'
       expect(release.permissions).toEqual({ contents: 'write' });
       expect(releasePackageRoutes(releaseWorkflow, publish)).toEqual([]);
       expect(publish.permissions).toEqual({ 'id-token': 'write' });
+      expect(releasePackageRoutes(releaseWorkflow, dockerDispatch)).toEqual([]);
+      expect(dockerDispatch.permissions).toEqual({ contents: 'write' });
       expect(releaseWorkflow.permissions).toEqual({ contents: 'read' });
     });
 

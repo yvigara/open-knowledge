@@ -39,7 +39,7 @@ const OTHER_SECRETS = [
   'SLACK_WEBHOOK_URL',
 ];
 const SIGNING_ENVIRONMENT = 'release-signing';
-const OTHER_ENVIRONMENTS = ['inkeep-oss-sync'];
+const OTHER_ENVIRONMENTS = ['container-publish', 'inkeep-oss-sync'];
 const MAIN_ONLY = "${{ github.ref == 'refs/heads/main' && 'release-signing' || '' }}";
 const EXPECTED = {
   'desktop-build-win-linux.yml#build-windows': MAIN_ONLY,
