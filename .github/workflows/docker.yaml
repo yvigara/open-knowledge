@@ -120,12 +120,12 @@ jobs:
           # workflow_dispatch) has no release object, so the expression yields
           # '' and the fallback derives the answer from the version string:
           # the cadence only ever produces X.Y.Z or X.Y.Z-beta.N.
-          # --- BRANCH TEST HARNESS (drop the 'v0.66.2' fallback before merge) ---
-          # A branch run carries no release, no payload and no input, so the
-          # chain falls through to the hardcoded tag. v0.66.2 is npm's current
-          # `latest`, so the image really installs and the smoke's
-          # `ok --version` == OK_VERSION assertion is a real check.
-          RAW_TAG: ${{ github.event.release.tag_name || github.event.client_payload.version || inputs.version || 'v0.66.2' }}
+          # --- BRANCH TEST HARNESS (drop the npm `latest` fallback in run before merge) ---
+          # A branch run carries no release, no payload and no input, so RAW_TAG
+          # is '' and the run step resolves npm's current `latest`, so the image
+          # really installs and the smoke's `ok --version` == OK_VERSION
+          # assertion is a real check.
+          RAW_TAG: ${{ github.event.release.tag_name || github.event.client_payload.version || inputs.version }}
           IS_PRERELEASE: ${{ github.event.release.prerelease }}
           # --- BRANCH TEST HARNESS (drop TAG_PREFIX entirely before merge) ---
           # '' on every real run. On the branch, every computed tag gets a
@@ -137,6 +137,11 @@ jobs:
           TAG_PREFIX: ${{ (github.ref == 'refs/heads/docker-image' || github.head_ref == 'docker-image') && 'test-' || '' }}
         run: |
           set -euo pipefail
+          # BRANCH TEST HARNESS (drop before merge) — see RAW_TAG above.
+          if [ -z "$RAW_TAG" ]; then
+            RAW_TAG="$(npm view "${NPM_PACKAGE}@latest" version)"
+            echo "No release version on this run; using npm latest: ${RAW_TAG}"
+          fi
           VERSION="${RAW_TAG#v}"
           if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
             echo "::error::'${RAW_TAG}' is not a release version this lane can build (expected vX.Y.Z or vX.Y.Z-beta.N)." >&2
