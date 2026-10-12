@@ -1,0 +1,346 @@
+name: Docker Build, Test, and Publish
+# Builds the container image from a published @inkeep/open-knowledge npm version.
+# release.yml triggers it via repository_dispatch. GHCR auth uses GITHUB_TOKEN only.
+on:
+  # PR + main: build and smoke only, publish nothing.
+  pull_request:
+    paths:
+      - Dockerfile
+      - scripts/docker/**
+      - .github/workflows/docker.yaml
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - scripts/docker/**
+      - .github/workflows/docker.yaml
+  # Fired by release.yml after the npm publish. CI releases are published with
+  # GITHUB_TOKEN, which doesn't cascade the `release` event.
+  repository_dispatch:
+    types: [container-build]
+  # Recovery: a release published by hand with a PAT.
+  release:
+    types: [published]
+  # Recovery: rebuild the image for an existing release.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Released version to build, with or without the v prefix (e.g. v0.63.6 or 0.63.6-beta.3)"
+        required: true
+        type: string
+permissions:
+  contents: read
+# Never cancel release runs. Kept out of `ok-release-cadence` so it can't stall a release.
+concurrency:
+  group: docker-${{ github.event.pull_request.number || github.event.release.tag_name || github.event.client_payload.version || inputs.version || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  IMAGE_NAME: ghcr.io/inkeep/open-knowledge
+  NPM_PACKAGE: "@inkeep/open-knowledge"
+jobs:
+  prepare:
+    # Publish triggers only. Every later publish job needs prepare.
+    if: >-
+      github.event_name == 'repository_dispatch' || github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      tags: ${{ steps.resolve.outputs.tags }}
+    steps:
+      - name: Resolve version + Docker tags
+        id: resolve
+        env:
+          # Dispatched runs have no release object; prerelease is derived from the version.
+          RAW_TAG: ${{ github.event.release.tag_name || github.event.client_payload.version || inputs.version }}
+          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -euo pipefail
+          VERSION="${RAW_TAG#v}"
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'${RAW_TAG}' is not a release version this lane can build (expected vX.Y.Z or vX.Y.Z-beta.N)." >&2
+            exit 1
+          fi
+          case "$VERSION" in
+            *-*) DERIVED=true ;;
+            *)   DERIVED=false ;;
+          esac
+          PRERELEASE="${IS_PRERELEASE:-$DERIVED}"
+
+          TAGS="${IMAGE_NAME}:${VERSION}"
+          if [ "$PRERELEASE" = "true" ]; then
+            # Betas never get `latest` or X.Y.
+            TAGS="${TAGS},${IMAGE_NAME}:beta"
+          else
+            MINOR="${VERSION%.*}"
+            TAGS="${TAGS},${IMAGE_NAME}:${MINOR},${IMAGE_NAME}:latest"
+          fi
+
+          {
+            echo "version=${VERSION}"
+            echo "prerelease=${PRERELEASE}"
+            echo "tags=${TAGS}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building ${NPM_PACKAGE}@${VERSION} -> ${TAGS}"
+      # Covers npm read-after-write lag and manual triggers that race the npm publish.
+      - name: Wait for the npm version to be published
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 90); do
+            if npm view "${NPM_PACKAGE}@${VERSION}" version >/dev/null 2>&1; then
+              echo "${NPM_PACKAGE}@${VERSION} is on npm (attempt ${attempt})."
+              exit 0
+            fi
+            echo "Attempt ${attempt}/90: ${NPM_PACKAGE}@${VERSION} not on npm yet; retrying in 20s."
+            sleep 20
+          done
+          echo "::error::${NPM_PACKAGE}@${VERSION} never appeared on npm after 30 minutes. Check the Release job in release.yml, then re-run this workflow via workflow_dispatch." >&2
+          exit 1
+  # Unprivileged build + smoke, safe for PR code.
+  build:
+    # prepare is skipped on PR/main; a skipped dependency isn't a failure.
+    needs: [prepare]
+    if: always() && needs.prepare.result != 'failure' && needs.prepare.result != 'cancelled'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          # Native arm64: npm install under QEMU is much slower.
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      # PR/main has no release, so test against npm `latest`.
+      OK_VERSION: ${{ needs.prepare.outputs.version || 'latest' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Retry once: buildx setup is flaky on the network.
+      - name: Set up Docker Buildx
+        id: buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Set up Docker Buildx (retry)
+        if: steps.buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build ${{ matrix.arch }} image
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            OK_VERSION=${{ env.OK_VERSION }}
+          load: true
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:ci-${{ matrix.arch }}
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          cache-to: type=gha,scope=docker-${{ matrix.arch }},mode=max
+      - name: Smoke - binaries present and version pinned
+        run: |
+          set -euo pipefail
+          IMG="${IMAGE_NAME}:ci-${{ matrix.arch }}"
+          docker run --rm --entrypoint git "$IMG" --version
+          # Line 1 is the version; the rest is the license notice.
+          NOTICE="$(docker run --rm --entrypoint ok "$IMG" --version)"
+          INSTALLED="$(printf '%s\n' "$NOTICE" | head -n 1 | tr -d '[:space:]')"
+          INSTALLED="${INSTALLED#v}"
+          echo "ok --version reports: ${INSTALLED}"
+          if [ "${OK_VERSION}" != "latest" ] && [ "${INSTALLED}" != "${OK_VERSION}" ]; then
+            echo "::error::Image pins ${INSTALLED} but this run is building ${OK_VERSION}." >&2
+            exit 1
+          fi
+      # The server refuses a 0.0.0.0 bind without OK_ALLOW_EXTERNAL=1.
+      - name: Smoke - first boot initializes and serves
+        run: |
+          set -euo pipefail
+          IMG="${IMAGE_NAME}:ci-${{ matrix.arch }}"
+          VOLUME="ok-smoke-${{ matrix.arch }}-${{ github.run_id }}"
+          trap 'docker logs ok-smoke 2>&1 | tail -n 100 || true; docker rm -f ok-smoke >/dev/null 2>&1 || true; docker volume rm -f "$VOLUME" >/dev/null 2>&1 || true' EXIT
+          docker volume create "$VOLUME" >/dev/null
+          docker run -d --name ok-smoke \
+            -e OK_ALLOW_EXTERNAL=1 \
+            -v "${VOLUME}:/opt/data" \
+            -p 127.0.0.1:8080:8080 \
+            "$IMG"
+          for attempt in $(seq 1 120); do
+            if [ "$(docker inspect -f '{{.State.Running}}' ok-smoke)" != "true" ]; then
+              echo "::error::Container exited during first boot." >&2
+              exit 1
+            fi
+            if curl -fsS --max-time 3 http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
+              echo "Server answered /healthz after ${attempt}s."
+              docker exec ok-smoke test -d /opt/data/.ok
+              echo "Volume initialized at /opt/data/.ok."
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::/healthz never answered within 120s." >&2
+          exit 1
+  # Only publish and merge get `packages: write`.
+  publish:
+    needs: [prepare, build]
+    if: >-
+      github.repository == 'inkeep/open-knowledge' && (
+        github.event_name == 'repository_dispatch' ||
+        github.event_name == 'release' ||
+        github.event_name == 'workflow_dispatch'
+      )
+    environment: container-publish
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    # No Actions cache in a job that can push: a poisoned layer would ship.
+    cache-mode: none
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout trusted source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Docker Buildx
+        id: buildx
+        continue-on-error: true
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Set up Docker Buildx (retry)
+        if: steps.buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Push by digest; merge tags the manifest list once both arches succeed.
+      - name: Push ${{ matrix.arch }} by digest
+        id: push
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          build-args: |
+            OK_VERSION=${{ needs.prepare.outputs.version }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.push.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+  merge:
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+    cache-mode: none
+    timeout-minutes: 15
+    environment: container-publish
+    # id-token: write is for cosign keyless signing.
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Download digest artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create + push the tagged manifest list
+        env:
+          TAGS: ${{ needs.prepare.outputs.tags }}
+        run: |
+          set -euo pipefail
+          TAG_ARGS=""
+          IFS=','
+          for tag in $TAGS; do
+            TAG_ARGS="${TAG_ARGS} --tag ${tag}"
+          done
+          unset IFS
+          SOURCES=""
+          for f in /tmp/digests/*; do
+            SOURCES="${SOURCES} ${IMAGE_NAME}@sha256:$(basename "$f")"
+          done
+          # shellcheck disable=SC2086
+          docker buildx imagetools create ${TAG_ARGS} ${SOURCES}
+      # Sign the manifest list digest: it covers every tag and stays valid when `latest` moves.
+      - name: Resolve + verify the published manifest
+        id: manifest
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "${IMAGE_NAME}:${VERSION}"
+          DIGEST="$(docker buildx imagetools inspect "${IMAGE_NAME}:${VERSION}" \
+            --format '{{json .Manifest}}' | jq -er '.digest')"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Signing ${IMAGE_NAME}@${DIGEST}"
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign the manifest list (keyless)
+        env:
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${IMAGE_NAME}@${DIGEST}"
+      # `refs/` matches both dispatch (main) and release (tag) runs.
+      - name: Verify the signature
+        env:
+          DIGEST: ${{ steps.manifest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign verify \
+            --certificate-identity-regexp "^https://github\.com/${GITHUB_REPOSITORY}/\.github/workflows/docker\.yaml@refs/" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${IMAGE_NAME}@${DIGEST}" > /dev/null
+          echo "Verified cosign signature on ${IMAGE_NAME}@${DIGEST}."
+          {
+            echo "### Container image published"
+            echo
+            echo "- \`${IMAGE_NAME}@${DIGEST}\`"
+            echo "- Tags: \`${{ needs.prepare.outputs.tags }}\`"
+            echo "- Signed with cosign keyless; verify with:"
+            echo
+            echo '```sh'
+            echo "cosign verify \\"
+            echo "  --certificate-identity-regexp '^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/docker.yaml@refs/' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  ${IMAGE_NAME}@${DIGEST}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

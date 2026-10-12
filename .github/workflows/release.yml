@@ -794,3 +794,39 @@ jobs:
 
           echo "Publishing with --tag ${TAG} (VERSION=${VERSION})"
           npm publish "$TARBALL" --access public --tag "$TAG" --provenance --registry https://registry.npmjs.org/
+
+  # Triggers docker.yaml for the version just published. GITHUB_TOKEN-published
+  # releases don't cascade, so it must be an explicit dispatch. Separate job
+  # because the dispatches API needs `contents: write`. Fire-and-forget: a
+  # failed image build never blocks the release.
+  docker-dispatch:
+    name: Trigger container image build (${{ github.event.action || github.event_name }})
+    needs: [build, release, publish]
+    if: github.event.action == 'publish-stable' || needs.build.outputs.run_beta == 'true'
+    runs-on: ubuntu-latest
+    cache-mode: none
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Trigger docker.yaml to build + publish the container image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTION: ${{ github.event.action }}
+          BETA_VERSION: ${{ needs.release.outputs.version }}
+          STABLE_VERSION: ${{ github.event.client_payload.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$ACTION" == "publish-stable" ]]; then
+            VERSION="$STABLE_VERSION"
+          else
+            VERSION="$BETA_VERSION"
+          fi
+          if [[ -z "$VERSION" ]]; then
+            echo "::warning::No release version resolved; skipping the container-build dispatch. Rebuild with 'gh workflow run docker.yaml -f version=<version>'."
+            exit 0
+          fi
+          payload=$(jq -nc --arg version "v${VERSION}" \
+            '{event_type: "container-build", client_payload: {version: $version}}')
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/dispatches" --input - <<<"$payload"
+          echo "Dispatched container-build for v${VERSION}; docker.yaml will build, smoke, publish and cosign-sign the multi-arch image."
