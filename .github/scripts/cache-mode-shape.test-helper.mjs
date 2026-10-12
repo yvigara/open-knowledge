@@ -21,6 +21,7 @@ const ACTIONS = {
   'taiki-e/install-action': CACHE_FREE,
   'linear/linear-release-action': CACHE_FREE,
   'docker/setup-buildx-action': CACHE_FREE,
+  'docker/setup-qemu-action': CACHE_FREE,
   'docker/login-action': CACHE_FREE,
   'sigstore/cosign-installer': CACHE_FREE,
   'docker/build-push-action': (inputs) => [

@@ -69,7 +69,6 @@ describe('credentialed jobs in public/open-knowledge/.github/workflows declare t
       'desktop-release.yml#release-consumers': 'none',
       'desktop-release.yml#alert': 'none',
       'docker.yaml#publish': 'none',
-      'docker.yaml#merge': 'none',
       'linear-pr-relay.yml#relay': 'none',
       'linear-release.yml#stamp': 'none',
       'monorepo-pr-bridge.yml#acknowledge': 'none',
