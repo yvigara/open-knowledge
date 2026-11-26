@@ -6,7 +6,7 @@ name: Fork container image
 # Renovate can track them.
 on:
   push:
-    branches: [main]
+    branches: [main, claude/fork-container-image] # TEMP: drop before merge
     paths:
       - Dockerfile
       - scripts/docker/**
