@@ -1,0 +1,79 @@
+name: Fork container image
+
+# Publishes ghcr.io/<owner>/open-knowledge from the @inkeep/open-knowledge
+# version pinned in the Dockerfile. Renovate bumps that pin; merging the bump
+# to main publishes it. Tags are plain semver (`0.89.17`) so downstream
+# Renovate can track them.
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - scripts/docker/**
+      - .github/workflows/fork-image.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/open-knowledge
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: meta
+        run: |
+          version=$(sed -n 's/^ARG OK_VERSION=//p' Dockerfile)
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Dockerfile OK_VERSION '$version' is not a stable X.Y.Z version." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build amd64 and smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.IMAGE }}:smoke
+      - name: Smoke - version pinned, first boot serves
+        run: |
+          set -euo pipefail
+          installed="$(docker run --rm --entrypoint ok "$IMAGE:smoke" --version | head -n 1 | tr -d '[:space:]')"
+          [ "${installed#v}" = "${{ steps.meta.outputs.version }}" ] || { echo "::error::image has ${installed}" >&2; exit 1; }
+          trap 'docker logs ok-smoke 2>&1 | tail -n 50 || true; docker rm -f ok-smoke >/dev/null 2>&1 || true' EXIT
+          docker run -d --name ok-smoke -e OK_ALLOW_EXTERNAL=1 -p 127.0.0.1:8080:8080 "$IMAGE:smoke"
+          for i in $(seq 1 120); do
+            [ "$(docker inspect -f '{{.State.Running}}' ok-smoke)" = true ] || { echo "::error::container exited" >&2; exit 1; }
+            curl -fsS --max-time 3 http://127.0.0.1:8080/healthz >/dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "::error::/healthz never answered" >&2
+          exit 1
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
+            ${{ env.IMAGE }}:latest
+      - run: echo "digest ${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"

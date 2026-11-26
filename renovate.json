@@ -1,0 +1,24 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "This fork tracks upstream by merging, so Renovate only manages the container image's pinned @inkeep/open-knowledge version.",
+  "enabledManagers": ["custom.regex"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Dockerfile ARG pins annotated '# renovate: datasource=... depName=...'",
+      "managerFilePatterns": ["/(^|/)Dockerfile$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s]+)\\s+ARG [A-Z_]+=(?<currentValue>[^\\s]+)"
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Stable releases only; the image's moving 'latest' follows these.",
+      "matchDatasources": ["npm"],
+      "matchPackageNames": ["@inkeep/open-knowledge"],
+      "ignoreUnstable": true,
+      "commitMessageTopic": "open-knowledge image"
+    }
+  ]
+}
